@@ -13,6 +13,7 @@ import scala.cli.CurrentParams
 import scala.cli.commands.util.SharedOptionsUtil._
 import scala.cli.internal.ProcUtil
 import scala.util.Properties
+import scala.build.compiler.SimpleScalaCompiler
 
 object Run extends ScalaCommand[RunOptions] {
   override def group = "Main"
@@ -52,11 +53,29 @@ object Run extends ScalaCommand[RunOptions] {
     defaultInputs: () => Option[Inputs]
   ): Unit = {
     CurrentParams.verbosity = options.shared.logging.verbosity
-    val inputs = options.shared.inputsOrExit(inputArgs, defaultInputs = defaultInputs)
-    CurrentParams.workspaceOpt = Some(inputs.workspace)
 
     val initialBuildOptions = buildOptions(options)
     val logger              = options.shared.logger
+//    initialBuildOptions.artifacts(logger, scala.build.options.Scope.Main)
+//    if((options.shared.scalac.scalacOption intersect ScalacOptions.scalacHelpOptions.toSeq).nonEmpty) {
+    if(options.shared.scalac.scalacOption.contains("-help")) {
+      val simpleScalaCompiler = SimpleScalaCompiler("java", Nil, scaladoc = false)
+      val scalaVersion = initialBuildOptions.scalaOptions.scalaVersion
+      val artifacts = value(initialBuildOptions.artifacts(logger, scala.build.options.Scope.Main))
+      scalaVersion match {
+        case Some(sv) =>
+          val javacOptions = initialBuildOptions.javaOptions.javacOptions
+          val scalacOptions = options.shared.scalac.scalacOption.toSeq
+          val compilerClassPath = artifacts.compilerClassPath
+          val javaHome = initialBuildOptions.javaHomeLocation().value
+          val exitCode = simpleScalaCompiler.runRawScalacLike(sv.asString, Option(javaHome), javacOptions, scalacOptions, compilerClassPath, logger)
+          sys.exit(exitCode)
+        case None =>
+          sys.exit(1)
+      }
+    }
+    val inputs = options.shared.inputsOrExit(inputArgs, defaultInputs = defaultInputs)
+    CurrentParams.workspaceOpt = Some(inputs.workspace)
     val threads             = BuildThreads.create()
 
     val compilerMaker = options.shared.compilerMaker(threads)
