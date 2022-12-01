@@ -2,22 +2,15 @@ package scala.build.options
 
 import com.github.plokhotnyuk.jsoniter_scala.core.*
 import com.github.plokhotnyuk.jsoniter_scala.macros.*
-import coursier.Versions
+import coursier.{MavenRepository, Versions, ivyRepositoryString}
 import coursier.cache.{ArtifactError, FileCache}
 import coursier.core.{Module, Repository, Version, Versions as CoreVersions}
 import coursier.util.{Artifact, Task}
 
 import java.io.File
-
 import scala.build.CoursierUtils.*
 import scala.build.EitherCps.{either, value}
-import scala.build.errors.{
-  BuildException,
-  InvalidBinaryScalaVersionError,
-  NoValidScalaVersionFoundError,
-  ScalaVersionError,
-  UnsupportedScalaVersionError
-}
+import scala.build.errors.{BuildException, InvalidBinaryScalaVersionError, NoValidScalaVersionFoundError, ScalaVersionError, UnsupportedScalaVersionError}
 import scala.build.internal.Regexes.scala2NightlyRegex
 import scala.build.internal.Util
 import scala.concurrent.duration.DurationInt
@@ -179,10 +172,11 @@ object ScalaVersionUtil {
   def validateNonStable(
     scalaVersionStringArg: String,
     cache: FileCache[Task],
-    latestSupportedStableVersions: Seq[String]
+    latestSupportedStableVersions: Seq[String],
+    extraRepositories: Seq[String] = Seq.empty
   ): Either[ScalaVersionError, String] = {
     val versionPool =
-      ScalaVersionUtil.allMatchingVersions(Some(scalaVersionStringArg), cache)
+      ScalaVersionUtil.allMatchingVersions(Some(scalaVersionStringArg), cache, extraRepositories)
 
     if (versionPool.contains(scalaVersionStringArg))
       if (isSupportedVersion(scalaVersionStringArg))
@@ -267,7 +261,8 @@ object ScalaVersionUtil {
 
   def allMatchingVersions(
     maybeScalaVersionArg: Option[String],
-    cache: FileCache[Task]
+    cache: FileCache[Task],
+    extraRepositories: Seq[String] = Seq.empty
   ): Seq[String] = {
 
     val modules =
@@ -280,11 +275,14 @@ object ScalaVersionUtil {
       else
         Seq(scala2Library, scala3Library)
 
+    val csExtraRepositories = extraRepositories.map(MavenRepository(_))
+
     modules
       .flatMap { mod =>
         val versions = cache.logger.use {
           try Versions(cache)
               .withModule(mod)
+              .withRepositories(csExtraRepositories)
               .result()
               .unsafeRun()(cache.ec)
           catch {

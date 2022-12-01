@@ -287,17 +287,18 @@ final case class BuildOptions(
 
   lazy val scalaParams: Either[BuildException, Option[ScalaParameters]] =
     if (System.getenv("CI") == null)
-      computeScalaParams(Constants.version, finalCache).orElse(
+      computeScalaParams(Constants.version, finalCache, classPathOptions.extraRepositories).orElse(
         // when the passed scala version is missed in the cache, we always force a cache refresh
         // https://github.com/VirtusLab/scala-cli/issues/1090
-        computeScalaParams(Constants.version, finalCache.withTtl(0.seconds))
+        computeScalaParams(Constants.version, finalCache.withTtl(0.seconds), classPathOptions.extraRepositories)
       )
     else
-      computeScalaParams(Constants.version, finalCache.withTtl(0.seconds))
+      computeScalaParams(Constants.version, finalCache.withTtl(0.seconds), classPathOptions.extraRepositories)
 
   private[build] def computeScalaParams(
     scalaCliVersion: String,
-    cache: FileCache[Task] = finalCache
+    cache: FileCache[Task] = finalCache,
+    extraRepositories: Seq[String] = Seq.empty
   ): Either[BuildException, Option[ScalaParameters]] = either {
 
     lazy val maxSupportedStableScalaVersions = latestSupportedStableScalaVersion(scalaCliVersion)
@@ -339,7 +340,8 @@ final case class BuildOptions(
               ScalaVersionUtil.validateNonStable(
                 versionString,
                 cache,
-                latestSupportedStableVersions
+                latestSupportedStableVersions,
+                extraRepositories
               )
             case versionString =>
               ScalaVersionUtil.validateStable(
