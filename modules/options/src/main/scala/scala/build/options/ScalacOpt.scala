@@ -10,7 +10,7 @@ final case class ScalacOpt(value: String) {
   /** @return raw key for the option (only if the key can be shadowed from the CLI) */
   private[options] def shadowableKey: Option[String] = key match
     case Some(key)
-        if ScalacOpt.repeatingKeys.exists(rKey => rKey.startsWith(key + ":") || rKey == key) => None
+        if ScalacOpt.repeatingKeys.exists(rKey => rKey.contains(":") || rKey == key) => None
     case otherwise => otherwise
 }
 
