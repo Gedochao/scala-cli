@@ -84,21 +84,35 @@ object MsvcEnvironment {
             else arg
           }.mkString(" ")
 
-          // Build a batch file that calls vcvars then runs native-image
-          // in the same session — no environment capture/replay needed.
+          // Build a batch file that:
+          //   1. calls vcvars64.bat (with the inherited, non-SUBST CWD)
+          //   2. locates cl.exe and passes it explicitly to native-image
+          //      (works around GraalVM native-image not finding cl.exe via
+          //       PATH when the process runs from a SUBST-drive CWD)
+          //   3. switches to the shortened SUBST working directory
+          //   4. runs native-image.exe
           val batchContent =
             s"""@call "$vcvarsCmd"
                |@if errorlevel 1 exit /b %ERRORLEVEL%
                |@set GRAALVM_ARGUMENT_VECTOR_PROGRAM_NAME=native-image
-               |@$quotedArgs
+               |@for /f "delims=" %%i in ('where cl.exe 2^>nul') do @set "CL_EXE=%%i"
+               |@if not defined CL_EXE (
+               |  echo cl.exe not found in PATH after vcvars 1>&2
+               |  exit /b 1
+               |)
+               |@cd /d "$nativeImageWorkDir"
+               |@$quotedArgs --native-compiler-path="%CL_EXE%"
                |""".stripMargin
           val batchFile = os.temp(suffix = ".bat", contents = batchContent)
 
           logger.debug(s"native-image w/args: $updatedCommand")
 
           try
+            // Don't pass cwd here — let cmd.exe inherit the parent's real
+            // (non-SUBST) CWD so that vcvars64.bat runs without SUBST issues.
+            // The batch file does `cd /d` to the shortened workdir before
+            // launching native-image.
             val result = os.proc(cmdExe, "/c", batchFile.toString).call(
-              cwd = nativeImageWorkDir,
               stdout = os.Inherit,
               stderr = os.Inherit,
               check = false
