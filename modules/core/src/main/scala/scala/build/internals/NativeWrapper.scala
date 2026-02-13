@@ -1,18 +1,18 @@
 package scala.build.internals
-import java.util.Locale
 
 import scala.annotation.tailrec
 import scala.build.Logger
-import scala.collection.immutable.TreeMap
 import scala.io.Source
 import scala.util.Using
 
 /*
- * Directly invoke `native-image.exe`:
- *   run `vcvarsall.bat` **only to capture environment**
- *   merge MSVC environment and base environments.
- *   directly spawn native-image.exe
- * Avoids problematic Ctrl-C behavior of .bat / .cmd files.
+ * Invoke `native-image.exe` inside a vcvars-initialized cmd.exe session.
+ *
+ * A temp batch file calls `vcvars64.bat` to set up MSVC, then runs
+ * `native-image.exe` directly in the same session.  This avoids the
+ * fragile pattern of capturing the vcvars environment via `set` and
+ * replaying it through Java's ProcessBuilder, which silently loses
+ * PATH entries on some JVM / Windows combinations.
  */
 
 object MsvcEnvironment {
@@ -23,7 +23,14 @@ object MsvcEnvironment {
   private val pathLengthLimit = 90
 
   /*
-   * Call `native-image.exe` with captured vcvarsall.bat environment.
+   * Call `native-image.exe` inside a vcvars-initialized cmd.exe session.
+   *
+   * Rather than capturing the vcvars environment and replaying it (which is
+   * fragile — Java's ProcessBuilder env handling on Windows can silently lose
+   * PATH entries set by vcvars64.bat), we write a small batch file that:
+   *   1. calls vcvars64.bat  (sets up MSVC in the session)
+   *   2. runs native-image.exe directly (inherits the live session env)
+   *
    * @return process exit code.
    */
   def msvcNativeImageProcess(
@@ -31,9 +38,8 @@ object MsvcEnvironment {
     workingDir: os.Path,
     logger: Logger
   ): Int = {
-    // Shorten the working dir for native-image only (it creates deeply nested internal paths
-    // that can exceed Windows 260-char MAX_PATH). We must NOT use the SUBST drive for vcvars
-    // capture: running vcvars64.bat with a SUBST-drive CWD causes its PATH setup to silently fail.
+    // Shorten the working dir for native-image (it creates deeply nested internal
+    // paths that can exceed the Windows 260-char MAX_PATH limit).
     val (nativeImageWorkDir, driveToUnalias) =
       if (workingDir.toString.length >= pathLengthLimit) {
         val (driveLetter, shortPath) = getShortenedPath(workingDir, logger)
@@ -51,42 +57,10 @@ object MsvcEnvironment {
         case Some(vcvars) =>
           logger.debug(s"Using vcvars script $vcvars")
 
-          // Capture vcvars env using the ORIGINAL (non-SUBST) workingDir as CWD.
-          // vcvars64.bat doesn't depend on CWD for its setup, but using a SUBST drive
-          // as CWD causes it to silently fail to add MSVC tools to PATH.
-          val msvcEnv: Map[String, String] = captureVcvarsEnv(vcvars, workingDir, logger)
-
           // show aliased drive map
           getSubstMappings.foreach((k, v) => logger.message(s"substMap  $k: -> $v"))
 
-          // Log whether vcvars captured a usable MSVC environment
-          val includeValue = msvcEnv.getOrElse("INCLUDE", "")
-          val pathValue    = msvcEnv.getOrElse("PATH", msvcEnv.getOrElse("Path", ""))
-          val vcPathCount  = pathValue.split(";").count(_.toLowerCase.contains("\\vc\\"))
-          logger.message(
-            s"vcvars: INCLUDE set=${includeValue.nonEmpty}, VC PATH entries=$vcPathCount, env size=${msvcEnv.size}"
-          )
-
-          val finalEnv =
-            msvcEnv +
-              ("GRAALVM_ARGUMENT_VECTOR_PROGRAM_NAME" -> "native-image")
-
-          logger.debug(s"msvc PATH entries:")
-          finalEnv.getOrElse("PATH", "").split(";").toSeq.foreach { entry =>
-            logger.debug(s"$entry;")
-          }
-          Seq(
-            "VCToolsInstallDir",
-            "VCToolsVersion",
-            "VCINSTALLDIR",
-            "WindowsSdkDir",
-            "WindowsSdkVersion",
-            "INCLUDE",
-            "LIB",
-            "LIBPATH"
-          ).foreach { key =>
-            logger.debug(s"""$key=${msvcEnv.getOrElse(key, "<missing>")}""")
-          }
+          val vcvarsCmd = vcvars.toIO.getAbsolutePath
 
           // Replace native-image.cmd with native-image.exe, if applicable
           val updatedCommand: Seq[String] =
@@ -104,165 +78,39 @@ object MsvcEnvironment {
                 command
             }
 
+          // Quote arguments that contain batch-special characters
+          val quotedArgs = updatedCommand.map { arg =>
+            if arg.exists(c => " &|^<>()".contains(c)) then s""""$arg""""
+            else arg
+          }.mkString(" ")
+
+          // Build a batch file that calls vcvars then runs native-image
+          // in the same session — no environment capture/replay needed.
+          val batchContent =
+            s"""@call "$vcvarsCmd"
+               |@if errorlevel 1 exit /b %ERRORLEVEL%
+               |@set GRAALVM_ARGUMENT_VECTOR_PROGRAM_NAME=native-image
+               |@$quotedArgs
+               |""".stripMargin
+          val batchFile = os.temp(suffix = ".bat", contents = batchContent)
+
           logger.debug(s"native-image w/args: $updatedCommand")
 
-          // Run native-image with the SHORTENED working dir to avoid 260-char path limit
-          val result =
-            os.proc(updatedCommand)
-              .call(
-                cwd = nativeImageWorkDir,
-                env = finalEnv,
-                stdout = os.Inherit,
-                stderr = os.Inherit
-              )
-
-          result.exitCode
+          try
+            val result = os.proc(cmdExe, "/c", batchFile.toString).call(
+              cwd = nativeImageWorkDir,
+              stdout = os.Inherit,
+              stderr = os.Inherit,
+              check = false
+            )
+            result.exitCode
+          finally
+            try os.remove(batchFile)
+            catch { case _: Exception => }
       }
     }
     finally
       driveToUnalias.foreach(unaliasDriveLetter)
-  }
-
-  // =========================
-  // Capture MSVC environment
-  // =========================
-  private def captureVcvarsEnv(
-    vcvars: os.Path,
-    workingDir: os.Path,
-    logger: Logger
-  ): Map[String, String] = {
-
-    val vcvarsCmd = vcvars.toIO.getAbsolutePath
-
-    val sentinel = "vcvSentinel_7f4a2b"
-
-    // Write the vcvars invocation to a temp batch file instead of passing it inline
-    // to cmd.exe /c. This avoids Windows command-line quoting issues: Java's
-    // ProcessBuilder may escape embedded quotes in the /c argument, which breaks
-    // cmd.exe's interpretation of the chained commands (set, call, echo, etc.).
-    val batchContent =
-      s"""@set "VSCMD_DEBUG=1"
-         |@call "$vcvarsCmd"
-         |@echo $sentinel
-         |@where cl
-         |@where link
-         |@where lib
-         |@cl /Bv
-         |@set
-         |""".stripMargin
-    val batchFile = os.temp(suffix = ".bat", contents = batchContent)
-
-    val out = new StringBuilder
-    val err = new StringBuilder
-
-    val res =
-      try
-        os.proc(cmdExe, "/c", batchFile.toString).call(
-          cwd = workingDir,
-          env = sys.env,
-          stdout = os.ProcessOutput.Readlines(line => out.append(line).append("\n")),
-          stderr = os.ProcessOutput.Readlines(line => err.append(line).append("\n")),
-          check = false
-        )
-      finally
-        try os.remove(batchFile)
-        catch { case _: Exception => }
-
-    if res.exitCode != 0 then
-      logger.error(s"vcvars call failed with exit code ${res.exitCode}")
-      Map.empty
-    else
-      def toVec(iter: Iterator[String]): Vector[String] =
-        iter.map(_.trim).filter(_.nonEmpty).toVector
-      val errlines = toVec(
-        err.result().linesIterator
-      ).filter(_ != "cl : Command line error D8003 : missing source filename")
-      val outlines = toVec(out.result().linesIterator)
-
-      // Split at sentinel
-      val (debugLog, afterSentinel) = outlines.span(_ != sentinel)
-
-      // Drop the sentinel itself
-      val envLines   = afterSentinel.drop(1)
-      val debugLines = errlines ++ debugLog
-
-      given Ordering[String] =
-        Ordering.by[String, String](_.toLowerCase(Locale.ROOT))(using Ordering.String)
-
-      // Parse KEY=VALUE lines, preserving original key casing
-      val envMap =
-        TreeMap.empty[String, String] ++
-          envLines.flatMap { line =>
-            line.split("=", 2) match
-              case Array(k, v) => Some(k -> v) // preserve original spelling
-              case _           => None
-          }
-
-      if logger.verbosity > 0 then
-        debugLines.foreach(dbg => logger.debug(s"$dbg"))
-        debugLines.find(_.contains("Writing post-execution environment to ")) match {
-          case None    =>
-          case Some(s) =>
-            val envMapFile = s.replaceFirst(".* environment to ", "")
-            envReport(envMap, envMapFile, logger)
-        }
-
-      envMap
-  }
-
-  def envReport(captEnv: Map[String, String], logfile: String, logger: Logger): Unit = {
-    import java.nio.file.{Files, Paths}
-    import scala.jdk.CollectionConverters.*
-
-    val path = Paths.get(logfile)
-
-    if !Files.exists(path) then
-      logger.message(s"not found: $logfile")
-    else
-      // Parse KEY=VALUE lines from the file
-      val fileEnv: Map[String, String] =
-        Files.readAllLines(path).asScala.flatMap { line =>
-          line.split("=", 2) match
-            case Array(k, v) => Some(k -> v)
-            case _           => None
-        }.toMap
-
-      // Keys present in both but with different values
-      val differingValues =
-        for
-          (k, v1) <- captEnv
-          v2      <- fileEnv.get(k)
-          if v1 != v2
-        yield (k, v1, v2)
-
-      // Keys only in captured env
-      val onlyInCaptured =
-        captEnv.keySet.diff(fileEnv.keySet).map(k => k -> captEnv(k))
-
-      // Keys only in file env
-      val onlyInFile =
-        fileEnv.keySet.diff(captEnv.keySet).map(k => k -> fileEnv(k))
-
-      if differingValues.nonEmpty then
-        logger.debug("=== keys with different values ===")
-        differingValues.foreach { case (k, v1, v2) =>
-          logger.debug(s"$k:\n  captured = $v1\n  file     = $v2")
-        }
-
-      if onlyInCaptured.nonEmpty then
-        logger.debug("=== only in captured env ===")
-        onlyInCaptured.foreach { case (k, v) =>
-          logger.debug(s"$k = $v")
-        }
-
-      if onlyInFile.nonEmpty then
-        logger.debug("=== only in file env ===")
-        onlyInFile.foreach { case (k, v) =>
-          logger.debug(s"$k = $v")
-        }
-
-      if differingValues.isEmpty && onlyInCaptured.isEmpty && onlyInFile.isEmpty then
-        logger.debug("envReport: no differences")
   }
 
   def getSubstMappings: Map[Char, String] =
