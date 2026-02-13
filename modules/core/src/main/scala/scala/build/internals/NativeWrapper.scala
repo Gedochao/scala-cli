@@ -59,6 +59,14 @@ object MsvcEnvironment {
           // show aliased drive map
           getSubstMappings.foreach((k, v) => logger.message(s"substMap  $k: -> $v"))
 
+          // Log whether vcvars captured a usable MSVC environment
+          val includeValue = msvcEnv.getOrElse("INCLUDE", "")
+          val pathValue    = msvcEnv.getOrElse("PATH", msvcEnv.getOrElse("Path", ""))
+          val vcPathCount  = pathValue.split(";").count(_.toLowerCase.contains("\\vc\\"))
+          logger.message(
+            s"vcvars: INCLUDE set=${includeValue.nonEmpty}, VC PATH entries=$vcPathCount, env size=${msvcEnv.size}"
+          )
+
           val finalEnv =
             msvcEnv +
               ("GRAALVM_ARGUMENT_VECTOR_PROGRAM_NAME" -> "native-image")
@@ -127,22 +135,38 @@ object MsvcEnvironment {
     val vcvarsCmd = vcvars.toIO.getAbsolutePath
 
     val sentinel = "vcvSentinel_7f4a2b"
-    val cmd      = Seq(
-      cmdExe,
-      "/c",
-      s"""set "VSCMD_DEBUG=1" & call "$vcvarsCmd" & echo $sentinel & where cl & where link & where lib & cl /Bv & set"""
-    )
+
+    // Write the vcvars invocation to a temp batch file instead of passing it inline
+    // to cmd.exe /c. This avoids Windows command-line quoting issues: Java's
+    // ProcessBuilder may escape embedded quotes in the /c argument, which breaks
+    // cmd.exe's interpretation of the chained commands (set, call, echo, etc.).
+    val batchContent =
+      s"""@set "VSCMD_DEBUG=1"
+         |@call "$vcvarsCmd"
+         |@echo $sentinel
+         |@where cl
+         |@where link
+         |@where lib
+         |@cl /Bv
+         |@set
+         |""".stripMargin
+    val batchFile = os.temp(suffix = ".bat", contents = batchContent)
 
     val out = new StringBuilder
     val err = new StringBuilder
 
-    val res = os.proc(cmd).call(
-      cwd = workingDir,
-      env = sys.env,
-      stdout = os.ProcessOutput.Readlines(line => out.append(line).append("\n")),
-      stderr = os.ProcessOutput.Readlines(line => err.append(line).append("\n")),
-      check = false
-    )
+    val res =
+      try
+        os.proc(cmdExe, "/c", batchFile.toString).call(
+          cwd = workingDir,
+          env = sys.env,
+          stdout = os.ProcessOutput.Readlines(line => out.append(line).append("\n")),
+          stderr = os.ProcessOutput.Readlines(line => err.append(line).append("\n")),
+          check = false
+        )
+      finally
+        try os.remove(batchFile)
+        catch { case _: Exception => }
 
     if res.exitCode != 0 then
       logger.error(s"vcvars call failed with exit code ${res.exitCode}")
