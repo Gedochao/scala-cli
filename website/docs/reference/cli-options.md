@@ -388,7 +388,7 @@ Version of SBT to be used for the export (2.0.0 by default)
 
 ### `--mill-version`
 
-Version of Mill to be used for the export (1.1.6 by default)
+Version of Mill to be used for the export (1.1.7 by default)
 
 ### `--mvn-version`
 
@@ -1707,6 +1707,10 @@ Exclude sources
 ### `--object-wrapper`
 
 Force object wrapper for scripts
+
+### `--lazyvalgrade`
+
+Patch Scala 3.0-3.7.x lazy val bytecode on the classpath for JDK 26+ compatibility
 
 ### `--auto-setup-ide`
 
